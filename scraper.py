@@ -1,28 +1,17 @@
 """
-RAM price scraper for computerbase.de price-comparison pages.
+RAM price scraper — computerbase.de via Playwright headless Chromium.
 
-Architecture
-────────────
-computerbase.de embeds a Geizhals (gzhls.at) widget that renders offers
-client-side via JavaScript.  The raw server HTML returned to plain HTTP clients
-has no offer data, so we bypass it entirely and go to the underlying Geizhals
-source page instead.
-
-Article IDs in the computerbase.de URLs (e.g. …-a3164911.html) map 1-to-1 to
-Geizhals product pages:
-    https://geizhals.at/eu/a3164911.html
-    → redirects to https://geizhals.eu/…-a3164911.html
-
-The Geizhals page is fully server-side-rendered HTML — no JS required.
+computerbase.de price-comparison pages render their offer list entirely
+client-side via a Geizhals JavaScript widget.  A real browser is required
+to execute that JS and expose offer data in the DOM.
 
 Extraction strategy
 ───────────────────
-1. Derive the Geizhals URL from the article ID in the computerbase.de URL.
-2. Fetch with requests (browser User-Agent).
-3. Parse the offer list (#lazy-list--offers .offer) with BeautifulSoup.
+1. Open the computerbase.de URL in a headless Chromium page.
+2. Wait for .gh_price elements to appear (main frame, then any child frames).
+3. Collect offer rows; extract price (.gh_price) and shop (data-merchant-name).
 4. Drop eBay and Amazon Marketplace offers (keep Amazon direct).
-5. Parse price from .gh_price text; shop name from data-merchant-name attr.
-6. Return the lowest price and shop name.
+5. Return the lowest price and shop name.
 """
 
 import logging
@@ -30,8 +19,8 @@ import random
 import re
 import time
 
-import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PWTimeout
 
 from database import init_db, insert_price
 from models import MODULES
@@ -43,46 +32,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-GEIZHALS_BASE = "https://geizhals.at/eu/"
-GEIZHALS_HOME = "https://geizhals.at/"
-
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "de-AT,de;q=0.9,de-DE;q=0.8,en-US;q=0.7,en;q=0.6",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Cache-Control": "max-age=0",
-    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-SESSION = requests.Session()
-SESSION.headers.update(REQUEST_HEADERS)
-
-
-def _warm_up_session() -> None:
-    """Visit the Geizhals homepage to obtain cookies before scraping products."""
-    try:
-        resp = SESSION.get(GEIZHALS_HOME, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
-        log.debug("Session warmed up (cookies: %d)", len(SESSION.cookies))
-    except requests.RequestException as exc:
-        log.warning("Session warm-up failed (proceeding anyway): %s", exc)
+# Max ms to wait for price elements after page load
+OFFER_TIMEOUT_MS = 15_000
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +47,7 @@ def _is_excluded_seller(name: str, href: str) -> bool:
     Rules:
     - eBay: always excluded.
     - Amazon Marketplace: excluded when 'amazon' appears in the name but the
-      merchant href does NOT point to Amazon's own shop (.../merchants/amazon...).
+      merchant href does NOT point to Amazon's own shop (/merchants/amazon).
     - Amazon direct (sold & shipped by Amazon): included.
     """
     name_lower = name.lower()
@@ -106,32 +57,15 @@ def _is_excluded_seller(name: str, href: str) -> bool:
         return True
 
     if "amazon" in name_lower or "amazon.de" in href_lower or "amazon.com" in href_lower:
-        # Official Amazon shop: href contains /merchants/amazon (geizhals pattern)
         if "/merchants/amazon" in href_lower and "marketplace" not in name_lower:
             return False  # Amazon direct — keep
-        return True  # Amazon Marketplace or ambiguous — skip
+        return True  # Marketplace or ambiguous — skip
 
     return False
 
 
 # ---------------------------------------------------------------------------
-# URL helpers
-# ---------------------------------------------------------------------------
-
-def _article_id(cb_url: str) -> str | None:
-    """Extract the article ID (e.g. 'a3164911') from a computerbase.de URL."""
-    m = re.search(r"-(a\d+)\.html", cb_url)
-    return m.group(1) if m else None
-
-
-def _geizhals_url(cb_url: str) -> str | None:
-    """Build the Geizhals fetch URL for a given computerbase.de product URL."""
-    aid = _article_id(cb_url)
-    return f"{GEIZHALS_BASE}{aid}.html" if aid else None
-
-
-# ---------------------------------------------------------------------------
-# Core scraper
+# Price parsing
 # ---------------------------------------------------------------------------
 
 def _parse_price(text: str) -> float | None:
@@ -143,60 +77,126 @@ def _parse_price(text: str) -> float | None:
         return None
 
 
-def scrape_module(name: str, cb_url: str) -> tuple[float, str] | tuple[None, None]:
+# ---------------------------------------------------------------------------
+# Core scraper
+# ---------------------------------------------------------------------------
+
+def _offers_from_context(context):
+    """Return offer element handles from a Page or Frame, or []."""
+    for selector in ("#lazy-list--offers .offer", ".offerlist .offer", ".offer"):
+        els = context.query_selector_all(selector)
+        if els:
+            return els
+    return []
+
+
+def _dismiss_consent(page) -> bool:
     """
-    Fetch the Geizhals page for the product and return (lowest_price, shop).
+    Click through the computerbase.de GDPR consent dialog if present.
+    Returns True if a consent button was clicked.
+    """
+    consent_selectors = [
+        "#cookie-consent-button",           # computerbase.de primary
+        ".js-consent-accept-button",        # computerbase.de fallback class
+        "button:has-text('Akzeptieren und weiter')",
+        "button:has-text('Alle akzeptieren')",
+        "button:has-text('Accept all')",
+    ]
+    for sel in consent_selectors:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                log.debug("Consent accepted via: %s", sel)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def scrape_module(name: str, cb_url: str, page) -> tuple[float, str] | tuple[None, None]:
+    """
+    Navigate to cb_url and return (lowest_price, shop).
     Returns (None, None) on any error.
     """
-    gh_url = _geizhals_url(cb_url)
-    if not gh_url:
-        log.error("[%s] Cannot build Geizhals URL from: %s", name, cb_url)
+    try:
+        page.goto(cb_url, wait_until="domcontentloaded", timeout=30_000)
+    except PWTimeout:
+        log.error("[%s] Page load timed out", name)
         return None, None
+    except Exception as exc:
+        log.error("[%s] Page load error: %s", name, exc)
+        return None, None
+
+    # Wait 2s for the consent dialog to appear (it loads asynchronously)
+    page.wait_for_timeout(2000)
+
+    # Dismiss consent if present; if clicked, wait for the page to settle
+    if _dismiss_consent(page):
+        try:
+            # "Akzeptieren und weiter" may trigger a full page reload
+            page.wait_for_load_state("domcontentloaded", timeout=10_000)
+        except PWTimeout:
+            pass
+        page.wait_for_timeout(2000)
+
+    # Scroll down so lazy-loaded widgets enter the viewport
+    page.evaluate("window.scrollBy(0, 600)")
+    page.wait_for_timeout(500)
+
+    # The Geizhals widget may render in the main frame or inside an iframe.
+    # Wait for .gh_price to appear in whichever context has it.
+    target = None
 
     try:
-        resp = SESSION.get(
-            gh_url,
-            timeout=20,
-            allow_redirects=True,
-            headers={"Referer": GEIZHALS_HOME},
+        page.wait_for_selector(".gh_price", timeout=OFFER_TIMEOUT_MS)
+        target = page
+    except PWTimeout:
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            try:
+                frame.wait_for_selector(".gh_price", timeout=5_000)
+                target = frame
+                break
+            except PWTimeout:
+                continue
+
+    if target is None:
+        # Check if the widget showed a rate-limit / error page
+        error_text = page.evaluate(
+            "() => document.body ? document.body.innerText : ''"
         )
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        log.error("[%s] Request failed: %s", name, exc)
+        if "Fehler im Preisvergleich" in error_text:
+            log.error("[%s] Geizhals rate-limit error page — try again later", name)
+        else:
+            log.warning("[%s] No price elements found after %dms", name, OFFER_TIMEOUT_MS)
         return None, None
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # The main offer list — deliberately narrow selector to exclude variant
-    # dropdown widgets and other price references outside the offer table.
-    offers = (
-        soup.select("#lazy-list--offers .offer")
-        or soup.select(".offerlist .offer")
-    )
-
+    offers = _offers_from_context(target)
     if not offers:
-        log.warning("[%s] No offer rows found in HTML", name)
+        log.warning("[%s] No offer rows found in DOM", name)
         return None, None
 
     valid: list[tuple[float, str]] = []
 
     for offer in offers:
         # ── Price ──────────────────────────────────────────────────────────
-        price_el = offer.select_one(".gh_price")
+        price_el = offer.query_selector(".gh_price")
         if not price_el:
             continue
-        price = _parse_price(price_el.get_text())
+        price = _parse_price(price_el.inner_text())
         if price is None:
             continue
 
         # ── Shop name ──────────────────────────────────────────────────────
-        merchant_link = offer.select_one("a[data-merchant-name]")
+        merchant_link = offer.query_selector("a[data-merchant-name]")
         if merchant_link:
-            shop_name = merchant_link["data-merchant-name"]
-            shop_href = merchant_link.get("href", "")
+            shop_name = merchant_link.get_attribute("data-merchant-name") or ""
+            shop_href = merchant_link.get_attribute("href") or ""
         else:
-            caption = offer.select_one(".merchant__logo-caption")
-            shop_name = caption.get_text(strip=True) if caption else "Unknown"
+            caption = offer.query_selector(".merchant__logo-caption")
+            shop_name = caption.inner_text().strip() if caption else "Unknown"
             shop_href = ""
 
         # ── Exclusion filter ───────────────────────────────────────────────
@@ -225,24 +225,33 @@ def scrape_module(name: str, cb_url: str) -> tuple[float, str] | tuple[None, Non
 
 def main() -> None:
     init_db()
-    _warm_up_session()
 
-    for module in MODULES:
-        name = module["name"]
-        url = module["url"]
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        page = browser.new_page()
+        page.set_extra_http_headers({
+            "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+        })
 
-        price, shop = scrape_module(name, url)
-        if price is not None:
-            insert_price(name, url, price, shop)
-        else:
-            log.warning("[%s] Skipped — no price obtained", name)
+        for module in MODULES:
+            name = module["name"]
+            url = module["url"]
 
-        # Polite delay between requests
-        delay = random.uniform(2.0, 3.5)
-        log.debug("Sleeping %.1fs", delay)
-        time.sleep(delay)
+            price, shop = scrape_module(name, url, page)
+            if price is not None:
+                insert_price(name, url, price, shop)
+            else:
+                log.warning("[%s] Skipped — no price obtained", name)
 
-    # Send the email report after all prices are stored
+            delay = random.uniform(4.0, 7.0)
+            log.debug("Sleeping %.1fs", delay)
+            time.sleep(delay)
+
+        browser.close()
+
     try:
         from notifier import send_report
         send_report()
