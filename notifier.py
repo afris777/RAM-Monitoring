@@ -19,7 +19,7 @@ from report import get_report_data
 
 RECIPIENT = "af@computerbase.de"
 SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 465
+SMTP_PORT = 587
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +143,10 @@ def send_report() -> None:
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.ehlo()
         server.login(sender, password)
         server.sendmail(sender, RECIPIENT, msg.as_string())
 

@@ -48,16 +48,22 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 GEIZHALS_BASE = "https://geizhals.at/eu/"
+GEIZHALS_HOME = "https://geizhals.at/"
 
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "de-AT,de;q=0.9,de-DE;q=0.8,en-US;q=0.7,en;q=0.6",
     "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Cache-Control": "max-age=0",
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
@@ -67,6 +73,16 @@ REQUEST_HEADERS = {
 
 SESSION = requests.Session()
 SESSION.headers.update(REQUEST_HEADERS)
+
+
+def _warm_up_session() -> None:
+    """Visit the Geizhals homepage to obtain cookies before scraping products."""
+    try:
+        resp = SESSION.get(GEIZHALS_HOME, timeout=15, allow_redirects=True)
+        resp.raise_for_status()
+        log.debug("Session warmed up (cookies: %d)", len(SESSION.cookies))
+    except requests.RequestException as exc:
+        log.warning("Session warm-up failed (proceeding anyway): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +154,12 @@ def scrape_module(name: str, cb_url: str) -> tuple[float, str] | tuple[None, Non
         return None, None
 
     try:
-        resp = SESSION.get(gh_url, timeout=20, allow_redirects=True)
+        resp = SESSION.get(
+            gh_url,
+            timeout=20,
+            allow_redirects=True,
+            headers={"Referer": GEIZHALS_HOME},
+        )
         resp.raise_for_status()
     except requests.RequestException as exc:
         log.error("[%s] Request failed: %s", name, exc)
@@ -204,6 +225,7 @@ def scrape_module(name: str, cb_url: str) -> tuple[float, str] | tuple[None, Non
 
 def main() -> None:
     init_db()
+    _warm_up_session()
 
     for module in MODULES:
         name = module["name"]
