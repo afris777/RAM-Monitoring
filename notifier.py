@@ -5,7 +5,7 @@ Credentials are read from environment variables:
     EMAIL_ADDRESS      — Gmail sender address
     EMAIL_APP_PASSWORD — Gmail App Password (not the account password)
 
-Recipient is hardcoded to af@computerbase.de.
+Recipients are hardcoded to af@computerbase.de and mg@computerbase.de.
 """
 
 import os
@@ -17,7 +17,7 @@ from email.mime.text import MIMEText
 
 from report import get_report_data
 
-RECIPIENT = "af@computerbase.de"
+RECIPIENTS = ["af@computerbase.de", "mg@computerbase.de"]
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
@@ -139,7 +139,7 @@ def send_report() -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = sender
-    msg["To"] = RECIPIENT
+    msg["To"] = ", ".join(RECIPIENTS)
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     context = ssl.create_default_context()
@@ -148,9 +148,9 @@ def send_report() -> None:
         server.starttls(context=context)
         server.ehlo()
         server.login(sender, password)
-        server.sendmail(sender, RECIPIENT, msg.as_string())
+        server.sendmail(sender, RECIPIENTS, msg.as_string())
 
-    print(f"Report sent to {RECIPIENT}")
+    print(f"Report sent to {', '.join(RECIPIENTS)}")
 
 
 if __name__ == "__main__":
