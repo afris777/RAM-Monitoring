@@ -50,22 +50,44 @@ SESSION.headers.update(HEADERS)
 # Seller-exclusion logic
 # ---------------------------------------------------------------------------
 
-def _is_excluded_seller(name: str) -> bool:
+def _is_excluded_seller(name: str, merchant_url: str = "") -> bool:
     """
     Return True when the offer should be excluded.
 
     Rules:
-    - eBay: always excluded.
-    - Amazon Marketplace: excluded when 'amazon' and 'marketplace' both
-      appear in the name (e.g. "Amazon Marketplace").
-    - Amazon direct (Amazon.de, sold & shipped by Amazon): included.
+    - eBay: always excluded. Detected via:
+        1. 'ebay' in the shop name (catches offers labelled 'eBay')
+        2. '-eb-de' or '-eb-com' in the computerbase merchant profile URL
+           (catches individual eBay seller accounts like 'bernis-products',
+            whose profile URL ends in e.g. 'bernis-products-46-eb-de')
+    - Amazon Marketplace (third-party sellers on amazon.de): excluded.
+      Detected via:
+        1. 'amazon' AND 'marketplace' in the shop name (legacy fallback)
+        2. '-am-de' or '-am-com' in the computerbase merchant profile URL
+           (third-party sellers have a URL like '{seller-id}-am-de',
+            e.g. 'a2pgpjl0bblhlx-am-de' for AnkerDirect)
+    - Amazon direct (merchant URL 'amazon-de', shop name 'Amazon.de'): included.
     """
     name_lower = name.lower()
+    url_lower = merchant_url.lower()
 
+    # eBay: by shop name
     if "ebay" in name_lower:
         return True
 
+    # eBay: by merchant profile URL suffix (-eb-de / -eb-com) or explicit domain
+    if "-eb-de" in url_lower or "-eb-com" in url_lower:
+        return True
+    if "ebay.de" in url_lower or "ebay.com" in url_lower:
+        return True
+
+    # Amazon Marketplace: by shop name (legacy fallback)
     if "amazon" in name_lower and "marketplace" in name_lower:
+        return True
+
+    # Amazon Marketplace: by merchant profile URL suffix
+    # Note: Amazon direct uses '.../merchants/amazon-de' which does NOT match '-am-de'
+    if "-am-de" in url_lower or "-am-com" in url_lower:
         return True
 
     return False
@@ -126,9 +148,18 @@ def scrape_module(name: str, cb_url: str) -> tuple[float, str] | tuple[None, Non
             caption = offer.select_one(".merchant__logo-caption")
             shop_name = caption.get_text(strip=True) if caption else "Unknown"
 
+        # ── Merchant profile URL — used to detect eBay / Amazon Marketplace ──
+        # The href may be absolute (https://www.computerbase.de/…) or relative
+        # (/preisvergleich/merchants/…) depending on what requests receives.
+        # Matching on '/merchants/' works for both forms.
+        cb_merchant_link = offer.select_one(
+            ".offer__merchant-info-links a[href*='/merchants/']"
+        )
+        merchant_url = cb_merchant_link.get("href", "") if cb_merchant_link else ""
+
         # ── Exclusion filter ───────────────────────────────────────────────
-        if _is_excluded_seller(shop_name):
-            log.debug("[%s] Excluding: %s", name, shop_name)
+        if _is_excluded_seller(shop_name, merchant_url):
+            log.info("[%s] Excluding: %s (merchant_url=%s)", name, shop_name, merchant_url)
             continue
 
         valid.append((price, shop_name))
